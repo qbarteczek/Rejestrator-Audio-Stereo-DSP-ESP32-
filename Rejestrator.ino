@@ -3,8 +3,9 @@
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <Audio.h>
 #include <EEPROM.h>
-#include <driver/i2s.h>
+#include <Arduino.h>
 
 // Setup OLED Display
 #define SCREEN_WIDTH 128
@@ -13,10 +14,14 @@
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // Audio Setup
-#define I2S_DATA_IN_PIN 32
-#define I2S_DATA_OUT_PIN I2S_PIN_NO_CHANGE
-#define I2S_CLK_PIN 27
-#define I2S_WS_PIN 14
+AudioInputI2S i2s_in;
+AudioOutputI2S i2s_out;
+AudioEffectCompress compressor;
+AudioFilterBandPass bandPass;
+AudioConnection patchCord1(i2s_in, compressor);
+AudioConnection patchCord2(compressor, bandPass);
+AudioConnection patchCord3(bandPass, i2s_out);
+AudioControlSGTL5000 sgtl5000;
 
 // Define Pins
 #define SD_CS_PIN 5
@@ -40,7 +45,6 @@ int profiles[PROFILE_COUNT][4]; // Array to store different profiles
 const char* fileName = "/audio.wav";
 
 // Function Declarations
-void setupI2S();
 void setupSD();
 void createDirectory(String dirName);
 void listFiles(String directory);
@@ -60,13 +64,16 @@ void setup() {
   Serial.begin(115200);
 
   // Initialize I2S
-  setupI2S();
+  AudioMemory(12);
+  sgtl5000.enable();
+  sgtl5000.volume(0.5);
+  sgtl5000.inputSelect(AUDIO_INPUT_LINEIN);
 
   // Initialize SD card
   setupSD();
 
   // Initialize OLED
-  if (!display.begin(SSD1306_I2C_ADDRESS, 0x3C)) { // 0x3C to typowy adres I2C dla SSD1306
+  if (!display.begin(SSD1306_I2C_ADDRESS, 0x3C)) {
     Serial.println(F("SSD1306 allocation failed"));
     for (;;);
   }
@@ -97,28 +104,6 @@ void loop() {
   updateDisplay();
   
   // Other functionalities like recording or playing audio can be managed here
-}
-
-// I2S setup
-void setupI2S() {
-  i2s_config_t i2s_config = {
-    .mode = I2S_MODE_MASTER | I2S_MODE_RX,
-    .sample_rate = 44100,
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
-    .communication_format = I2S_COMM_FORMAT_I2S,
-    .intr_alloc_flags = ESP_INTR_FLAG_DEFAULT,
-    .dma_buf_count = 8,
-    .dma_buf_len = 64
-  };
-  i2s_pin_config_t pin_config = {
-    .bck_io_num = I2S_CLK_PIN,
-    .ws_io_num = I2S_WS_PIN,
-    .data_out_num = I2S_DATA_OUT_PIN,
-    .data_in_num = I2S_DATA_IN_PIN
-  };
-  i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
-  i2s_set_pin(I2S_NUM_0, &pin_config);
 }
 
 // SD card setup
@@ -171,21 +156,17 @@ void writeWAVHeader(File file, uint32_t dataSize) {
   file.write(0x00);
   file.write(2);
   file.write(0x00);
-  file.write(44100 & 0xFF);
-  file.write((44100 >> 8) & 0xFF);
-  file.write((44100 >> 16) & 0xFF);
-  file.write((44100 >> 24) & 0xFF);
-  file.write((44100 * 2 * 16 / 8) & 0xFF);
-  file.write(((44100 * 2 * 16 / 8) >> 8) & 0xFF);
-  file.write(((44100 * 2 * 16 / 8) >> 16) & 0xFF);
-  file.write(((44100 * 2 * 16 / 8) >> 24) & 0xFF);
+  file.write(44100);
+  file.write(0xAC);
+  file.write(0x00);
+  file.write(0x00);
   file.write(16);
   file.write(0x00);
   file.write("data");
-  file.write(dataSize & 0xFF);
-  file.write((dataSize >> 8) & 0xFF);
-  file.write((dataSize >> 16) & 0xFF);
-  file.write((dataSize >> 24) & 0xFF);
+  file.write(dataSize);
+  file.write(0x00);
+  file.write(0x00);
+  file.write(0x00);
 }
 
 // Draw oscilloscope on OLED display
@@ -232,8 +213,7 @@ void recordAudio() {
     // Recording loop
     while (true) {
       int16_t buffer[256];
-      size_t bytes_read;
-      i2s_read(I2S_NUM_0, &buffer, sizeof(buffer), &bytes_read, portMAX_DELAY);
+      i2s_in.read(buffer, sizeof(buffer));
       applyEffects(buffer, sizeof(buffer) / sizeof(int16_t));
       audioFile.write((uint8_t*)buffer, sizeof(buffer));
       dataSize += sizeof(buffer);
@@ -252,8 +232,7 @@ void playAudio(String fileName) {
     int16_t buffer[256];
     while (audioFile.available()) {
       audioFile.read((uint8_t*)buffer, sizeof(buffer));
-      size_t bytes_written;
-      i2s_write(I2S_NUM_0, &buffer, sizeof(buffer), &bytes_written, portMAX_DELAY);
+      i2s_out.write(buffer, sizeof(buffer));
     }
     audioFile.close();
   }
