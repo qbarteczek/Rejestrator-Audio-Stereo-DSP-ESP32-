@@ -3,9 +3,9 @@
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <Audio.h>
 #include <EEPROM.h>
 #include <Arduino.h>
+#include "driver/i2s.h"
 
 // Setup OLED Display
 #define SCREEN_WIDTH 128
@@ -13,18 +13,11 @@
 #define OLED_RESET -1
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-// Audio Setup
-AudioInputI2S i2s_in;
-AudioOutputI2S i2s_out;
-AudioEffectCompress compressor;
-AudioFilterBandPass bandPass;
-AudioConnection patchCord1(i2s_in, compressor);
-AudioConnection patchCord2(compressor, bandPass);
-AudioConnection patchCord3(bandPass, i2s_out);
-AudioControlSGTL5000 sgtl5000;
-
 // Define Pins
 #define SD_CS_PIN 5
+#define I2S_WS 25
+#define I2S_SD 26
+#define I2S_SCK 27
 #define ENCODER_PIN_A 34
 #define ENCODER_PIN_B 35
 #define BUTTON_PIN 32
@@ -58,22 +51,20 @@ void playAudio(String fileName);
 void IRAM_ATTR handleEncoder();
 void IRAM_ATTR handleButton();
 void updateDisplay();
+void setupI2S();
 
 // Setup function
 void setup() {
   Serial.begin(115200);
 
   // Initialize I2S
-  AudioMemory(12);
-  sgtl5000.enable();
-  sgtl5000.volume(0.5);
-  sgtl5000.inputSelect(AUDIO_INPUT_LINEIN);
+  setupI2S();
 
   // Initialize SD card
   setupSD();
 
   // Initialize OLED
-  if (!display.begin(SSD1306_I2C_ADDRESS, 0x3C)) {
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
     Serial.println(F("SSD1306 allocation failed"));
     for (;;);
   }
@@ -102,7 +93,7 @@ void loop() {
 
   // Update display
   updateDisplay();
-  
+
   // Other functionalities like recording or playing audio can be managed here
 }
 
@@ -142,31 +133,27 @@ void listFiles(String directory) {
 
 // Write WAV header to a file
 void writeWAVHeader(File file, uint32_t dataSize) {
-  file.write("RIFF");
-  file.write((uint8_t)(36 + dataSize));
-  file.write(0x00);
-  file.write(0x00);
-  file.write("WAVE");
-  file.write("fmt ");
-  file.write(16);
-  file.write(0x00);
-  file.write(0x00);
-  file.write(0x00);
-  file.write(1);
-  file.write(0x00);
-  file.write(2);
-  file.write(0x00);
-  file.write(44100);
-  file.write(0xAC);
-  file.write(0x00);
-  file.write(0x00);
-  file.write(16);
-  file.write(0x00);
-  file.write("data");
-  file.write(dataSize);
-  file.write(0x00);
-  file.write(0x00);
-  file.write(0x00);
+  file.write((const uint8_t *)"RIFF", 4);
+  uint32_t fileSize = dataSize + 36;
+  file.write((const uint8_t *)&fileSize, 4);
+  file.write((const uint8_t *)"WAVE", 4);
+  file.write((const uint8_t *)"fmt ", 4);
+  uint32_t fmtChunkSize = 16;
+  file.write((const uint8_t *)&fmtChunkSize, 4);
+  uint16_t audioFormat = 1; // PCM
+  file.write((const uint8_t *)&audioFormat, 2);
+  uint16_t numChannels = 1; // Mono
+  file.write((const uint8_t *)&numChannels, 2);
+  uint32_t sampleRate = 44100;
+  file.write((const uint8_t *)&sampleRate, 4);
+  uint32_t byteRate = sampleRate * numChannels * 2;
+  file.write((const uint8_t *)&byteRate, 4);
+  uint16_t blockAlign = numChannels * 2;
+  file.write((const uint8_t *)&blockAlign, 2);
+  uint16_t bitsPerSample = 16;
+  file.write((const uint8_t *)&bitsPerSample, 2);
+  file.write((const uint8_t *)"data", 4);
+  file.write((const uint8_t *)&dataSize, 4);
 }
 
 // Draw oscilloscope on OLED display
@@ -196,12 +183,8 @@ void loadProfile(int profileIndex) {
 
 // Apply DSP effects to the audio buffer
 void applyEffects(int16_t* buffer, size_t size) {
-  compressor.setThreshold(compressionThreshold);
-  compressor.setRatio(compressionRatio);
-  bandPass.setLowFrequency(lowCutoff);
-  bandPass.setHighFrequency(highCutoff);
-  compressor.process(buffer, size);
-  bandPass.process(buffer, size);
+  // Placeholder for applying effects
+  // Implement your DSP effects here
 }
 
 // Record audio to SD card
@@ -213,13 +196,13 @@ void recordAudio() {
     // Recording loop
     while (true) {
       int16_t buffer[256];
-      i2s_in.read(buffer, sizeof(buffer));
-      applyEffects(buffer, sizeof(buffer) / sizeof(int16_t));
-      audioFile.write((uint8_t*)buffer, sizeof(buffer));
-      dataSize += sizeof(buffer);
+      size_t bytesRead = i2s_read(I2S_NUM_0, (void*)buffer, sizeof(buffer), &bytesRead, portMAX_DELAY);
+      applyEffects(buffer, bytesRead / sizeof(int16_t));
+      audioFile.write((uint8_t*)buffer, bytesRead);
+      dataSize += bytesRead;
       // Update WAV header with correct data size
       audioFile.seek(4);
-      audioFile.write((uint8_t)(36 + dataSize));
+      audioFile.write((const uint8_t*)&dataSize, 4);
     }
     audioFile.close();
   }
@@ -231,8 +214,8 @@ void playAudio(String fileName) {
   if (audioFile) {
     int16_t buffer[256];
     while (audioFile.available()) {
-      audioFile.read((uint8_t*)buffer, sizeof(buffer));
-      i2s_out.write(buffer, sizeof(buffer));
+      size_t bytesRead = audioFile.read((uint8_t*)buffer, sizeof(buffer));
+      i2s_write(I2S_NUM_0, (const char*)buffer, bytesRead, &bytesRead, portMAX_DELAY);
     }
     audioFile.close();
   }
@@ -253,4 +236,37 @@ void updateDisplay() {
   display.clearDisplay();
   // Draw UI elements and visualizations
   display.display();
+}
+// Define your I2S pins here
+#define I2S_BCK_PIN   26  // Example pin number for BCK
+#define I2S_WS_PIN    25  // Example pin number for WS
+#define I2S_DATA_OUT_PIN 22 // Example pin number for DATA OUT
+#define I2S_DATA_IN_PIN  23 // Example pin number for DATA IN
+
+void setupI2S() {
+  // Configuring I2S for ESP32
+  i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_TX),
+    .sample_rate = 44100,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+    .communication_format = I2S_COMM_FORMAT_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 8,
+    .dma_buf_len = 64,
+    .use_apll = false,
+    .tx_desc_auto_clear = true,
+    .fixed_mclk = 0
+  };
+
+  i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_BCK_PIN,
+    .ws_io_num = I2S_WS_PIN,
+    .data_out_num = I2S_DATA_OUT_PIN,
+    .data_in_num = I2S_DATA_IN_PIN
+  };
+
+  i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+  i2s_set_pin(I2S_NUM_0, &pin_config);
+  i2s_zero_dma_buffer(I2S_NUM_0);
 }
