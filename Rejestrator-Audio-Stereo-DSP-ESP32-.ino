@@ -3,270 +3,226 @@
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <EEPROM.h>
 #include <Arduino.h>
 #include "driver/i2s.h"
 
-// Setup OLED Display
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-#define OLED_RESET -1
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+// ==========================================
+// PIN DEFINITIONS
+// ==========================================
+#define SD_CS_PIN       5
+#define I2S_WS_PIN      25 // Word Select (L/R)
+#define I2S_BCK_PIN     26 // Serial Clock
+#define I2S_DATA_IN_PIN 22 // Data from Microphone
+#define BUTTON_PIN      32
+#define ENCODER_PIN_A   34
+#define ENCODER_PIN_B   35
 
-// Define Pins
-#define SD_CS_PIN 5
-#define I2S_WS 25
-#define I2S_SD 26
-#define I2S_SCK 27
-#define ENCODER_PIN_A 34
-#define ENCODER_PIN_B 35
-#define BUTTON_PIN 32
+// ==========================================
+// GLOBALS
+// ==========================================
+Adafruit_SSD1306 display(128, 64, &Wire, -1);
 
-// Encoder Variables
-volatile int encoderPos = 0;
 volatile bool buttonPressed = false;
+volatile bool isRecording = false;
 
-// Variables for Audio Settings
-float compressionThreshold = -20.0; // dB
-float compressionRatio = 4.0; // Compression ratio
-float lowCutoff = 80.0; // Low cutoff frequency (Hz)
-float highCutoff = 10000.0; // High cutoff frequency (Hz)
+File audioFile;
+const char* fileName = "/record.wav";
+uint32_t dataSize = 0;
 
-// Variables for File Management
-#define PROFILE_COUNT 3
-int profiles[PROFILE_COUNT][4]; // Array to store different profiles
-const char* fileName = "/audio.wav";
+float softwareGain = 2.0; // Prosty parametr DSP (wzmocnienie)
 
-// Function Declarations
-void setupSD();
-void createDirectory(String dirName);
-void listFiles(String directory);
-void writeWAVHeader(File file, uint32_t dataSize);
-void drawOscilloscope(int16_t* buffer, size_t size);
-void saveProfile(int profileIndex);
-void loadProfile(int profileIndex);
-void applyEffects(int16_t* buffer, size_t size);
-void recordAudio();
-void playAudio(String fileName);
-void IRAM_ATTR handleEncoder();
-void IRAM_ATTR handleButton();
-void updateDisplay();
-void setupI2S();
+// ==========================================
+// INTERRUPTS
+// ==========================================
+void IRAM_ATTR handleButton() {
+  static unsigned long lastInterruptTime = 0;
+  unsigned long interruptTime = millis();
+  // Prosty Debouncing (200ms)
+  if (interruptTime - lastInterruptTime > 200) {
+    buttonPressed = true;
+  }
+  lastInterruptTime = interruptTime;
+}
 
-// Setup function
+// ==========================================
+// WAV HEADER UTILS
+// ==========================================
+void writeWavHeader(File& file) {
+  // Pusty nagłówek na początek (44 bajty)
+  byte header[44] = {
+    'R','I','F','F', 0,0,0,0, 'W','A','V','E',
+    'f','m','t',' ', 16,0,0,0, 1,0, 2,0,      // PCM, 2 kanały (Stereo)
+    0x44,0xAC,0,0,                            // 44100 Hz
+    0x10,0xB1,0x02,0,                         // 44100 * 2 * 2 = 176400 (Byte rate)
+    4,0, 16,0,                                // 4 bajty na blok (2 kanały * 16 bit), 16 bit na próbkę
+    'd','a','t','a', 0,0,0,0
+  };
+  file.write(header, 44);
+}
+
+void finalizeWavFile(File& file, uint32_t audioDataSize) {
+  // Zapisz prawidłowe rozmiary po zakończeniu
+  uint32_t fileSize = audioDataSize + 36;
+  file.seek(4);
+  file.write((uint8_t*)&fileSize, 4);
+  file.seek(40);
+  file.write((uint8_t*)&audioDataSize, 4);
+  file.close();
+}
+
+// ==========================================
+// DSP FUNCTION
+// ==========================================
+void applyDSP(int16_t* buffer, size_t numSamples) {
+  // Prosty DSP: Cyfrowe wzmocnienie sygnału (Gain) z hard-clippingiem
+  for (size_t i = 0; i < numSamples; i++) {
+    int32_t sample = buffer[i] * softwareGain;
+    
+    // Zabezpieczenie przed przesterowaniem (Clipping)
+    if (sample > 32767) sample = 32767;
+    if (sample < -32768) sample = -32768;
+    
+    buffer[i] = (int16_t)sample;
+  }
+}
+
+// ==========================================
+// FREERTOS TASKS
+// ==========================================
+void audioTask(void * pvParameters) {
+  const size_t BUFFER_SIZE = 1024; // 1024 bajty
+  int16_t* i2s_read_buff = (int16_t*) malloc(BUFFER_SIZE);
+  
+  while (true) {
+    size_t bytesRead = 0;
+    // Odczyt I2S (zawsze, by opróżniać sprzętowy bufor)
+    esp_err_t err = i2s_read(I2S_NUM_0, (void*)i2s_read_buff, BUFFER_SIZE, &bytesRead, portMAX_DELAY);
+    
+    if (err == ESP_OK && bytesRead > 0) {
+      if (isRecording && audioFile) {
+        // Oblicz ilość 16-bitowych próbek
+        size_t numSamples = bytesRead / sizeof(int16_t);
+        
+        // 1. Aplikuj efekty DSP
+        applyDSP(i2s_read_buff, numSamples);
+        
+        // 2. Zapisz przetworzone audio na kartę SD
+        audioFile.write((uint8_t*)i2s_read_buff, bytesRead);
+        dataSize += bytesRead;
+      }
+    }
+    // Oddaj resztę czasu CPU
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+}
+
+void uiTask(void * pvParameters) {
+  while (true) {
+    // 1. Obsługa przycisków
+    if (buttonPressed) {
+      buttonPressed = false;
+      
+      if (!isRecording) {
+        // START NAGRYWANIA
+        SD.remove(fileName); // Usuń stary plik
+        audioFile = SD.open(fileName, FILE_WRITE);
+        if (audioFile) {
+          writeWavHeader(audioFile);
+          dataSize = 0;
+          isRecording = true;
+          Serial.println("Nagrywanie START...");
+        } else {
+          Serial.println("Błąd zapisu SD!");
+        }
+      } else {
+        // STOP NAGRYWANIA
+        isRecording = false;
+        if (audioFile) {
+          finalizeWavFile(audioFile, dataSize);
+          Serial.println("Nagrywanie STOP. Plik zapisany.");
+        }
+      }
+    }
+    
+    // 2. Odświeżanie OLED
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.setTextSize(1);
+    display.setTextColor(WHITE);
+    display.println("ESP32 Audio DSP");
+    display.println("-----------------");
+    
+    if (isRecording) {
+      display.println("Status: REC O");
+      display.printf("Rozmiar: %lu KB\n", dataSize / 1024);
+    } else {
+      display.println("Status: GOTOWY");
+      display.println("Wcisnij przycisk.");
+    }
+    
+    display.printf("DSP Gain: %.1fx\n", softwareGain);
+    display.display();
+    
+    vTaskDelay(pdMS_TO_TICKS(100)); // Odświeżaj ekran co 100ms
+  }
+}
+
+// ==========================================
+// INITIALIZATION
+// ==========================================
 void setup() {
   Serial.begin(115200);
-
-  // Initialize I2S
-  setupI2S();
-
-  // Initialize SD card
-  setupSD();
-
-  // Initialize OLED
-  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println(F("SSD1306 allocation failed"));
-    for (;;);
-  }
-  display.display();
-  delay(2000); // Pause for 2 seconds
-
-  // Initialize Encoder and Button
-  pinMode(ENCODER_PIN_A, INPUT_PULLUP);
-  pinMode(ENCODER_PIN_B, INPUT_PULLUP);
+  
+  // Przycisk
   pinMode(BUTTON_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(ENCODER_PIN_A), handleEncoder, CHANGE);
   attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), handleButton, FALLING);
-
-  // Load settings from EEPROM
-  EEPROM.begin(sizeof(profiles));
-  loadProfile(0); // Load default profile
-}
-
-// Loop function
-void loop() {
-  // Handle encoder and button input
-  if (buttonPressed) {
-    buttonPressed = false;
-    // Reset settings or change profile
+  
+  // OLED
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("Blad OLED");
+    for(;;);
   }
-
-  // Update display
-  updateDisplay();
-
-  // Other functionalities like recording or playing audio can be managed here
-}
-
-// SD card setup
-void setupSD() {
+  display.clearDisplay();
+  display.display();
+  
+  // SD Card
   if (!SD.begin(SD_CS_PIN)) {
-    Serial.println("SD Card initialization failed!");
-    return;
-  }
-  Serial.println("SD Card initialized.");
-}
-
-// Create directory on SD card
-void createDirectory(String dirName) {
-  if (SD.mkdir(dirName)) {
-    Serial.println("Directory created successfully");
+    Serial.println("Blad karty SD");
   } else {
-    Serial.println("Failed to create directory");
+    Serial.println("SD OK!");
   }
-}
 
-// List files in a directory on SD card
-void listFiles(String directory) {
-  File dir = SD.open(directory);
-  if (dir) {
-    File file = dir.openNextFile();
-    while (file) {
-      Serial.print("FILE: ");
-      Serial.println(file.name());
-      file = dir.openNextFile();
-    }
-    dir.close();
-  } else {
-    Serial.println("Failed to open directory");
-  }
-}
-
-// Write WAV header to a file
-void writeWAVHeader(File file, uint32_t dataSize) {
-  file.write((const uint8_t *)"RIFF", 4);
-  uint32_t fileSize = dataSize + 36;
-  file.write((const uint8_t *)&fileSize, 4);
-  file.write((const uint8_t *)"WAVE", 4);
-  file.write((const uint8_t *)"fmt ", 4);
-  uint32_t fmtChunkSize = 16;
-  file.write((const uint8_t *)&fmtChunkSize, 4);
-  uint16_t audioFormat = 1; // PCM
-  file.write((const uint8_t *)&audioFormat, 2);
-  uint16_t numChannels = 1; // Mono
-  file.write((const uint8_t *)&numChannels, 2);
-  uint32_t sampleRate = 44100;
-  file.write((const uint8_t *)&sampleRate, 4);
-  uint32_t byteRate = sampleRate * numChannels * 2;
-  file.write((const uint8_t *)&byteRate, 4);
-  uint16_t blockAlign = numChannels * 2;
-  file.write((const uint8_t *)&blockAlign, 2);
-  uint16_t bitsPerSample = 16;
-  file.write((const uint8_t *)&bitsPerSample, 2);
-  file.write((const uint8_t *)"data", 4);
-  file.write((const uint8_t *)&dataSize, 4);
-}
-
-// Draw oscilloscope on OLED display
-void drawOscilloscope(int16_t* buffer, size_t size) {
-  display.clearDisplay();
-  for (int i = 0; i < size; i++) {
-    int y = map(buffer[i], -32768, 32767, 0, 64);
-    display.drawLine(i, 32, i, y, WHITE);
-  }
-  display.display();
-}
-
-// Save profile to EEPROM
-void saveProfile(int profileIndex) {
-  EEPROM.put(profileIndex * sizeof(profiles[0]), profiles[profileIndex]);
-  EEPROM.commit();
-}
-
-// Load profile from EEPROM
-void loadProfile(int profileIndex) {
-  EEPROM.get(profileIndex * sizeof(profiles[0]), profiles[profileIndex]);
-  compressionThreshold = profiles[profileIndex][0];
-  compressionRatio = profiles[profileIndex][1];
-  lowCutoff = profiles[profileIndex][2];
-  highCutoff = profiles[profileIndex][3];
-}
-
-// Apply DSP effects to the audio buffer
-void applyEffects(int16_t* buffer, size_t size) {
-  // Placeholder for applying effects
-  // Implement your DSP effects here
-}
-
-// Record audio to SD card
-void recordAudio() {
-  File audioFile = SD.open(fileName, FILE_WRITE);
-  if (audioFile) {
-    uint32_t dataSize = 0;
-    writeWAVHeader(audioFile, dataSize);
-    // Recording loop
-    while (true) {
-      int16_t buffer[256];
-      size_t bytesRead = i2s_read(I2S_NUM_0, (void*)buffer, sizeof(buffer), &bytesRead, portMAX_DELAY);
-      applyEffects(buffer, bytesRead / sizeof(int16_t));
-      audioFile.write((uint8_t*)buffer, bytesRead);
-      dataSize += bytesRead;
-      // Update WAV header with correct data size
-      audioFile.seek(4);
-      audioFile.write((const uint8_t*)&dataSize, 4);
-    }
-    audioFile.close();
-  }
-}
-
-// Play audio from SD card
-void playAudio(String fileName) {
-  File audioFile = SD.open(fileName);
-  if (audioFile) {
-    int16_t buffer[256];
-    while (audioFile.available()) {
-      size_t bytesRead = audioFile.read((uint8_t*)buffer, sizeof(buffer));
-      i2s_write(I2S_NUM_0, (const char*)buffer, bytesRead, &bytesRead, portMAX_DELAY);
-    }
-    audioFile.close();
-  }
-}
-
-// Encoder interrupt handler
-void IRAM_ATTR handleEncoder() {
-  // Update encoder position
-}
-
-// Button interrupt handler
-void IRAM_ATTR handleButton() {
-  buttonPressed = true;
-}
-
-// Update OLED display with menu and visualizations
-void updateDisplay() {
-  display.clearDisplay();
-  // Draw UI elements and visualizations
-  display.display();
-}
-// Define your I2S pins here
-#define I2S_BCK_PIN   26  // Example pin number for BCK
-#define I2S_WS_PIN    25  // Example pin number for WS
-#define I2S_DATA_OUT_PIN 22 // Example pin number for DATA OUT
-#define I2S_DATA_IN_PIN  23 // Example pin number for DATA IN
-
-void setupI2S() {
-  // Configuring I2S for ESP32
+  // I2S
   i2s_config_t i2s_config = {
-    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_TX),
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate = 44100,
     .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT, // Stereo
     .communication_format = I2S_COMM_FORMAT_I2S,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
     .dma_buf_count = 8,
-    .dma_buf_len = 64,
+    .dma_buf_len = 1024,
     .use_apll = false,
-    .tx_desc_auto_clear = true,
+    .tx_desc_auto_clear = false,
     .fixed_mclk = 0
   };
-
+  
   i2s_pin_config_t pin_config = {
     .bck_io_num = I2S_BCK_PIN,
     .ws_io_num = I2S_WS_PIN,
-    .data_out_num = I2S_DATA_OUT_PIN,
+    .data_out_num = I2S_PIN_NO_CHANGE,
     .data_in_num = I2S_DATA_IN_PIN
   };
-
+  
   i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
   i2s_set_pin(I2S_NUM_0, &pin_config);
-  i2s_zero_dma_buffer(I2S_NUM_0);
+
+  // Uruchomienie zadań FreeRTOS
+  xTaskCreatePinnedToCore(audioTask, "AudioTask", 8192, NULL, 5, NULL, 1); // Wyższy priorytet na rdzeniu 1
+  xTaskCreatePinnedToCore(uiTask, "UITask", 4096, NULL, 1, NULL, 0);       // Niższy priorytet na rdzeniu 0
+}
+
+void loop() {
+  // Pusta pętla - system bazuje na zadaniach FreeRTOS
+  vTaskDelay(portMAX_DELAY);
 }
